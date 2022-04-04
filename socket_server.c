@@ -37,8 +37,10 @@ struct _ClientEntry {
 
 
 typedef TAILQ_HEAD(Clients,_ClientEntry) Queue;
-
 typedef struct _ServerOptions ServerOptions;
+typedef struct _Server Server;
+typedef struct _ConnectionsQueue ConnectionsQueue;
+
 struct _ServerOptions{
     int _terminator;
     int _max_length;
@@ -50,7 +52,6 @@ struct _ServerOptions{
     int _logfd;
 };
 
-typedef struct _Server Server;
 struct _Server{
     struct sockaddr_in _address;
     int _server_fd;
@@ -58,9 +59,9 @@ struct _Server{
     volatile sig_atomic_t _run;
     ServerOptions* _opts;
     pthread_t *_pool;
+    ConnectionsQueue *_queue;
 };
 
-typedef struct _ConnectionsQueue ConnectionsQueue;
 struct _ConnectionsQueue{
     sem_t* _semaphore;
     pthread_mutex_t _lock;
@@ -73,11 +74,13 @@ static Server Server_create(ServerOptions *options);
 
 bool Server_setup(Server *srv);
 
-void Server_run(Server *srv,ConnectionsQueue *queue);
+void Server_run(Server *srv);
 
 void* Server_client_handler(void* data);
 
 void* Server_log_handler(void* data);
+
+void Server_close(Server* srv);
 
 ConnectionsQueue ConnectionsQueue_create(int size);
 
@@ -85,6 +88,11 @@ bool ConnectionsQueue_push(ConnectionsQueue *queue, int fd);
 
 int ConnectionsQueue_pop(ConnectionsQueue *queue);
 
+static inline void sig_handler(int signum);
+
+//-------------------------------------------------------------------------------------
+//Global pointer to Server struct for signal handler
+Server *_server_;
 //-------------------------------------------------------------------------------------
 
 int main(int argc, char **argv){
@@ -92,6 +100,8 @@ int main(int argc, char **argv){
     ServerOptions opts;
     Server srv;
     int c;
+    
+    signal(SIGINT,sig_handler);
     
     opts._terminator = DEFAULT_TERMINATION_CHARACTER;
     opts._max_length = DEFAULT_LENGTH;
@@ -128,8 +138,11 @@ int main(int argc, char **argv){
 
     //create server data structure
     srv = Server_create(&opts);
+    _server_= &srv;
     //create queue data structure
     queue = ConnectionsQueue_create(opts._connection_buffer);
+    
+    srv._queue = &queue;
     
     //setup server and start listening
     if(!Server_setup(&srv)){
@@ -137,8 +150,10 @@ int main(int argc, char **argv){
     }
 
     //run server
-    Server_run(&srv,&queue);
+    Server_run(&srv);
 
+    Server_close(&srv);
+    
     return 0;
 }
 
@@ -167,11 +182,12 @@ bool Server_setup(Server *srv){
     }
     
     //open log file descriptor
-    if(!(srv->_opts->_logfd = open(srv->_opts->_log,O_APPEND | O_CREAT))){
+    if((srv->_opts->_logfd = open(srv->_opts->_log,O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR)) == -1){
         perror("failed to open log file");
         return false;
     }
     
+    //open pipe to log thread
     if(pipe(srv->_opts->_lfd) < 0 ){
         perror("failed to open pipe");
         return false;
@@ -204,15 +220,24 @@ bool Server_setup(Server *srv){
     return true;
 }
 
-void Server_run(Server *srv,ConnectionsQueue *queue){
+void Server_run(Server *srv){
+    pthread_t thl;
+    FILE *out;
     int new_fd;
        
-    if(!srv || !queue){
+    if(!srv){
+        return;
+    }
+    
+    pthread_create(&thl, NULL, Server_log_handler, srv);
+    
+    if(!(out = fdopen(srv->_opts->_lfd[1], "w"))){
+        perror("failed to open log stream");
         return;
     }
     
     for(int i = 0; i < srv->_opts->_thread_pool;++i){
-        pthread_create(&srv->_pool[i], NULL, Server_client_handler, queue);
+        pthread_create(&srv->_pool[i], NULL, Server_client_handler, srv);
     }
     
     while(srv->_run){
@@ -220,55 +245,94 @@ void Server_run(Server *srv,ConnectionsQueue *queue){
             perror("accept");
             continue;
         }
-        printf("new connection accepted\r\n");
-        ConnectionsQueue_push(queue,new_fd);
+        fprintf(out,"new connection accepted\r\n");
+        ConnectionsQueue_push(srv->_queue,new_fd);
     }
+    
+    fclose(out);
 }
 
 void* Server_client_handler(void* data){
-    ServerOptions* opts = (ServerOptions*) data;
-    char buffer[opts->_max_length];
+    Server *srv = (Server*) data; 
+    char buffer[srv->_opts->_max_length+1];
     //this variable preserves value across calls
     static int thread_id;
     ssize_t size;
-    int fd;
-
+    FILE *out;
+    int fd = 0;
     
-    printf("started new worker thread #%d\r\n",thread_id++);
+    if(!(out = fdopen(srv->_opts->_lfd[1], "w"))){
+        perror("failed to open log stream");
+        return 0;
+    }
     
-    for(;;){
-        printf("worker thread #%d waiting for connection\r\n",thread_id);
-        if((fd = ConnectionsQueue_pop(data)) <= 0){
+    fprintf(out,"started new worker thread #%d\r\n",thread_id++);
+    
+    memset(buffer,0,srv->_opts->_max_length);
+    
+    for(;srv->_run;){
+        fprintf(out,"worker thread #%d waiting for connection\r\n",thread_id);
+        fflush(out);
+        
+        if((fd = ConnectionsQueue_pop(srv->_queue)) <= 0){
             continue;
         }
         
-        printf("got connection\r\n");
-        for(;;){
-            if((size = recv(fd, buffer, opts->_max_length, 0)) > 0){
-                send(fd, buffer, size, 0);
+        fprintf(out,"got connection\r\n");
+        fflush(out);
+        
+        for(;srv->_run;){
+            if((size = recv(fd, buffer, srv->_opts->_max_length, 0)) > 0){
+                buffer[size] = 0;
+                if(strlen(buffer) == 2 && buffer[0] == srv->_opts->_terminator){
+                    send(fd,"SERVICE COMPLETE\r\n",strlen("SERVICE COMPLETE\r\n"),0);
+                    fprintf(out,"SERVICE COMPLETE\r\n");
+                    close(fd);
+                    fd = 0;
+                    break;
+                }else{
+                    send(fd, buffer, size, 0);
+                    fprintf(out,buffer);
+                    fflush(out);
+                }
             }else{
-                printf("connection lost\r\n");
+                fprintf(out,"connection lost\r\n");
+                fflush(out);
                 break;
             }
         }
     }
     
+    fclose(out);
+    close(fd);
+    
     return 0;
 }
 
 void* Server_log_handler(void* data){
-    ServerOptions* opts = (ServerOptions*) data;
-    char buffer[opts->_max_length];
+    Server* srv = (Server*) data;
+    char buffer[srv->_opts->_max_length];
     ssize_t size;
     
-    for(;;){
-        if((size = read(opts->_lfd[1],buffer,opts->_max_length))){
-            write(opts->_logfd,buffer,size);
-            fsync(opts->_logfd);
+    for(;srv->_opts->_lfd[0] && srv->_opts->_lfd[1];){
+        if((size = read(srv->_opts->_lfd[0],buffer,srv->_opts->_max_length)) > 0){
+            write(srv->_opts->_logfd,buffer,size);
+            fsync(srv->_opts->_logfd);
         }
     }
     
     return 0;
+}
+
+void Server_close(Server* srv){
+    ClientEntry* entry;
+    Queue *q = &srv->_queue->_connections;
+    
+    while (!TAILQ_EMPTY(q)) {
+        entry	= TAILQ_FIRST(q);
+        TAILQ_REMOVE(q, entry, entries);
+        free(entry);
+    }
 }
 
 ConnectionsQueue ConnectionsQueue_create(int size){
@@ -290,7 +354,6 @@ ConnectionsQueue ConnectionsQueue_create(int size){
         perror("thread obtain lock");
         return ret;
     }
-    printf("initialize queue\r\n");
 
     TAILQ_INIT(&ret._connections);
     
@@ -347,4 +410,9 @@ int ConnectionsQueue_pop(ConnectionsQueue *queue){
     free(elem);
         
     return ret;
+}
+
+static inline void sig_handler(int signum){
+    _server_->_run = false;
+    close(_server_->_server_fd); 
 }

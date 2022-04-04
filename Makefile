@@ -6,7 +6,7 @@
 ##############################################
 
 # Flags
-CFLAGS = -Wall
+CFLAGS = -Wall -pedantic
 
 # Math library
 
