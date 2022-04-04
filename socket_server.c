@@ -1,3 +1,4 @@
+#include <netdb.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -221,6 +222,7 @@ bool Server_setup(Server *srv){
 }
 
 void Server_run(Server *srv){
+    char cltaddr[INET6_ADDRSTRLEN];
     pthread_t thl;
     FILE *out;
     int new_fd;
@@ -240,12 +242,19 @@ void Server_run(Server *srv){
         pthread_create(&srv->_pool[i], NULL, Server_client_handler, srv);
     }
     
+    fprintf(out,"Program started\n");
+    fflush(out);
+    
     while(srv->_run){
         if ((new_fd = accept(srv->_server_fd, (struct sockaddr *)&srv->_address, (socklen_t*)&srv->_addrlen)) < 0){
             perror("accept");
             continue;
         }
-        fprintf(out,"new connection accepted\r\n");
+        
+        getnameinfo((struct sockaddr*)&srv->_address,srv->_addrlen,cltaddr,sizeof(cltaddr),0,0,NI_NUMERICHOST);
+        
+        fprintf(out,"new connection accepted: %s\n",cltaddr);
+        fflush(out);
         ConnectionsQueue_push(srv->_queue,new_fd);
     }
     
@@ -266,12 +275,12 @@ void* Server_client_handler(void* data){
         return 0;
     }
     
-    fprintf(out,"started new worker thread #%d\r\n",thread_id++);
+    fprintf(out,"started new worker thread #%d\n",thread_id++);
     
     memset(buffer,0,srv->_opts->_max_length);
     
     for(;srv->_run;){
-        fprintf(out,"worker thread #%d waiting for connection\r\n",thread_id);
+        fprintf(out,"worker thread #%d waiting for connection\n",thread_id);
         fflush(out);
         
         if((fd = ConnectionsQueue_pop(srv->_queue)) <= 0){
@@ -285,8 +294,8 @@ void* Server_client_handler(void* data){
             if((size = recv(fd, buffer, srv->_opts->_max_length, 0)) > 0){
                 buffer[size] = 0;
                 if(strlen(buffer) == 2 && buffer[0] == srv->_opts->_terminator){
-                    send(fd,"SERVICE COMPLETE\r\n",strlen("SERVICE COMPLETE\r\n"),0);
-                    fprintf(out,"SERVICE COMPLETE\r\n");
+                    send(fd,"SERVICE COMPLETE\n",strlen("SERVICE COMPLETE\n"),0);
+                    fprintf(out,"SERVICE COMPLETE\n");
                     close(fd);
                     fd = 0;
                     break;
@@ -296,7 +305,7 @@ void* Server_client_handler(void* data){
                     fflush(out);
                 }
             }else{
-                fprintf(out,"connection lost\r\n");
+                fprintf(out,"connection lost\n");
                 fflush(out);
                 break;
             }
