@@ -10,7 +10,7 @@ CFLAGS = -Wall -pedantic
 
 # Math library
 
-MATH_LIBS = -lm -lpthread
+LIBS = -lm -lpthread
 
 # Includes.
 INCLUDES=  -I.
@@ -18,7 +18,7 @@ INCLUDES=  -I.
 # Compiling all
 
 all:
-	gcc $(CFLAGS) socket_server.c -o ss
+	gcc $(CFLAGS) socket_server.c -o ss $(LIBS)
 
 # Clean obj files
 clean:
